@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, TypeVar
 
 from typing_extensions import dataclass_transform
 
-from . import core
+from . import background_tasks, core
 from .logging import log
 
 if TYPE_CHECKING:
@@ -72,6 +72,23 @@ def _refresh_step() -> None:
         del link, source_obj, target_obj  # pylint: disable=modified-iterating-list
     if time.time() - t > MAX_PROPAGATION_TIME:
         log.warning(f'binding propagation for {len(active_links)} active links took {time.time() - t:.3f} s')
+
+
+class _ActiveLinkRefresher:
+    task: asyncio.Task | None = None
+
+    @classmethod
+    def start(cls) -> None:
+        """If not already started, start the active bindings refresher task."""
+        if not cls.task:
+            cls.task = background_tasks.create(refresh_loop(), name='refresh bindings')
+
+    @classmethod
+    def stop(cls) -> None:
+        """If not already stopped, stop the active bindings refresher task."""
+        if cls.task:
+            cls.task.cancel()
+            cls.task = None
 
 
 def _propagate(source_obj: Any, source_name: str) -> None:
@@ -147,6 +164,8 @@ def bind_to(self_obj: Any, self_name: str, other_obj: Any, other_name: str,
     _check_self_and_other_attribute(self_obj, self_name, other_obj, other_name, self_strict, other_strict)
     bindings[(id(self_obj), self_name)].append((self_obj, other_obj, other_name, forward))
     if (id(self_obj), self_name) not in bindable_properties:
+        if not active_links:
+            _ActiveLinkRefresher.start()
         active_links.append((self_obj, self_name, other_obj, other_name, forward))
     _propagate(self_obj, self_name)
 
@@ -172,6 +191,8 @@ def bind_from(self_obj: Any, self_name: str, other_obj: Any, other_name: str,
     _check_self_and_other_attribute(self_obj, self_name, other_obj, other_name, self_strict, other_strict)
     bindings[(id(other_obj), other_name)].append((other_obj, self_obj, self_name, backward))
     if (id(other_obj), other_name) not in bindable_properties:
+        if not active_links:
+            _ActiveLinkRefresher.start()
         active_links.append((other_obj, other_name, self_obj, self_name, backward))
     _propagate(other_obj, other_name)
 
@@ -240,6 +261,9 @@ def remove(objects: Iterable[Any]) -> None:
         for source_obj, source_name, target_obj, target_name, transform in active_links
         if id(source_obj) not in object_ids and id(target_obj) not in object_ids
     ]
+    if not active_links:
+        _ActiveLinkRefresher.stop()
+
     for key, binding_list in list(bindings.items()):
         binding_list[:] = [
             (source_obj, target_obj, target_name, transform)
@@ -261,6 +285,7 @@ def reset() -> None:
     bindings.clear()
     bindable_properties.clear()
     active_links.clear()
+    _ActiveLinkRefresher.stop()
 
 
 @dataclass_transform()
